@@ -1,0 +1,118 @@
+from fastapi import FastAPI, HTTPException, Request, Form
+from pydantic import BaseModel
+from typing import List, Dict
+from sqlalchemy import create_engine, text
+import joblib
+import pandas as pd
+import numpy as np
+import datetime
+import os
+
+# === CONFIG - update to your DB creds ===
+DB_URI = "mysql+pymysql://root:your_password@localhost:3306/inventory_db"
+engine = create_engine(DB_URI, pool_pre_ping=True)
+
+app = FastAPI(title="Online Inventory Management API")
+
+# Load models dict on startup
+MODEL_CACHE = {}
+
+def load_model_for_sku(sku):
+    path = f"model_{sku}.joblib"
+    if os.path.exists(path):
+        MODEL_CACHE[sku] = joblib.load(path)
+        return MODEL_CACHE[sku]
+    else:
+        return None
+
+# Simple Pydantic schemas
+class Product(BaseModel):
+    id: int
+    sku: str
+    name: str
+    min_level: int
+    reorder_qty: int
+    current_stock: int
+
+@app.get("/products", response_model=List[Product])
+def list_products():
+    with engine.connect() as conn:
+        rows = conn.execute(text("SELECT id, sku, name, min_level, reorder_qty, current_stock FROM products")).fetchall()
+        products = [dict(r._mapping) for r in rows]
+        return products
+
+@app.get("/product/{sku}")
+def get_product(sku: str):
+    with engine.connect() as conn:
+        row = conn.execute(text("SELECT id, sku, name, min_level, reorder_qty, current_stock FROM products WHERE sku=:sku"), {"sku": sku}).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="SKU not found")
+        return dict(row._mapping)
+
+def prepare_features_for_date(df, target_date):
+    d = pd.DataFrame({'sale_date':[target_date]})
+    d['dayofweek'] = d['sale_date'].dt.dayofweek
+    d['month'] = d['sale_date'].dt.month
+    d['day'] = d['sale_date'].dt.day
+    # compute rolling from historical df
+    hist = df.copy()
+    hist = hist.set_index('sale_date').asfreq('D', fill_value=0).reset_index()
+    hist['r7'] = hist['qty_sold'].rolling(7, min_periods=1).mean()
+    hist['r30'] = hist['qty_sold'].rolling(30, min_periods=1).mean()
+    last_row = hist.iloc[-1]
+    d['r7'] = last_row['r7']
+    d['r30'] = last_row['r30']
+    return d[['dayofweek','month','day','r7','r30']]
+
+@app.get("/predict_demand/{sku}")
+def predict_demand(sku: str, days: int = 7):
+    # Load model
+    model = MODEL_CACHE.get(sku) or load_model_for_sku(sku)
+    if model is None:
+        raise HTTPException(status_code=404, detail="Model for SKU not found. Train model first.")
+    # load historical sales
+    q = "SELECT sale_date, qty_sold FROM sales_history WHERE sku=:sku ORDER BY sale_date"
+    with engine.connect() as conn:
+        df = pd.read_sql(text(q), conn, params={"sku": sku}, parse_dates=['sale_date'])
+    if df.empty:
+        raise HTTPException(status_code=404, detail="No sales history for SKU")
+    result = []
+    last_date = df['sale_date'].max()
+    for i in range(1, days+1):
+        target = last_date + pd.Timedelta(days=i)
+        X = prepare_features_for_date(df, pd.to_datetime(target))
+        pred = model.predict(X)[0]
+        result.append({"date": str(target.date()), "predicted_qty": float(round(pred,2))})
+    return {"sku": sku, "predictions": result}
+
+@app.get("/alerts")
+def get_alerts():
+    # Simple alert: if predicted 7-day consumption forecasted > current_stock - min_level then recommend reorder
+    alerts = []
+    with engine.connect() as conn:
+        products = conn.execute(text("SELECT sku, name, current_stock, min_level, reorder_qty FROM products")).fetchall()
+        for p in products:
+            s = dict(p._mapping)
+            sku = s['sku']
+            try:
+                pred_resp = predict_demand(sku, days=7)
+                total_next7 = sum([d['predicted_qty'] for d in pred_resp['predictions']])
+                # if total_next7 + min_level > current_stock => reorder suggested
+                if total_next7 + s['min_level'] > s['current_stock']:
+                    alerts.append({
+                        "sku": sku,
+                        "name": s['name'],
+                        "current_stock": s['current_stock'],
+                        "expected_consumption_next7": total_next7,
+                        "recommended_reorder_qty": s['reorder_qty']
+                    })
+            except Exception:
+                continue
+    return {"alerts": alerts}
+
+# endpoint to update stock after an order is placed / sale recorded
+@app.post("/update_stock/{sku}/{delta}")
+def update_stock(sku: str, delta: int):
+    with engine.connect() as conn:
+        conn.execute(text("UPDATE products SET current_stock = current_stock + :delta WHERE sku = :sku"), {"delta": delta, "sku": sku})
+    return {"status": "ok", "sku": sku, "delta": delta}
